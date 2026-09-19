@@ -63,17 +63,18 @@ class ConfidenceGate:
             self.fallback_rate = float(y.mean()) if len(y) else 0.5
             return self
         X = features_to_matrix(features)
-        self.model = lgb.LGBMClassifier(
-            n_estimators=self.n_estimators, learning_rate=self.learning_rate,
-            num_leaves=self.num_leaves, min_child_samples=self.min_child_samples,
-            objective="binary", verbose=-1,
-        ).fit(X, y)
+        params = {"objective": "binary", "learning_rate": self.learning_rate,
+                  "num_leaves": self.num_leaves,
+                  "min_data_in_leaf": self.min_child_samples,
+                  "verbose": -1, "feature_pre_filter": False}
+        self.model = lgb.train(params, lgb.Dataset(X, label=y),
+                               num_boost_round=self.n_estimators)
         return self
 
     def predict_proba(self, features: list[dict[str, float]]) -> np.ndarray:
         if self.model is None:
             return np.full(len(features), self.fallback_rate)
-        return self.model.predict_proba(features_to_matrix(features))[:, 1]
+        return np.asarray(self.model.predict(features_to_matrix(features)))
 
 
 def weighted_rrf(library: list[str], retrieval: list[str], p: float,
@@ -228,14 +229,23 @@ class DualGate:
     ret_rate: float = 0.5
 
     def _fit_one(self, X, y):
+        """Train one head with LightGBM's native API.
+
+        Deliberately not LGBMClassifier: the sklearn wrapper pulls in
+        scikit-learn, and the scoring notebook runs with internet disabled, so
+        every extra dependency is another wheel to package. lgb.train needs
+        only lightgbm itself.
+        """
         y = np.asarray(y, dtype=int)
         if lgb is None or len(y) < 50 or y.min() == y.max():
             return None, float(y.mean()) if len(y) else 0.5
-        m = lgb.LGBMClassifier(
-            n_estimators=self.n_estimators, learning_rate=self.learning_rate,
-            num_leaves=self.num_leaves, min_child_samples=self.min_child_samples,
-            objective="binary", verbose=-1).fit(X, y)
-        return m, float(y.mean())
+        params = {"objective": "binary", "learning_rate": self.learning_rate,
+                  "num_leaves": self.num_leaves,
+                  "min_data_in_leaf": self.min_child_samples,
+                  "verbose": -1, "feature_pre_filter": False}
+        booster = lgb.train(params, lgb.Dataset(X, label=y),
+                            num_boost_round=self.n_estimators)
+        return booster, float(y.mean())
 
     def fit(self, lib_feats, lib_labels, ret_feats, ret_labels) -> "DualGate":
         self.lib_model, self.lib_rate = self._fit_one(
@@ -247,9 +257,9 @@ class DualGate:
     def predict(self, lib_feats, ret_feats) -> tuple[np.ndarray, np.ndarray]:
         n = len(lib_feats)
         p_lib = (np.full(n, self.lib_rate) if self.lib_model is None
-                 else self.lib_model.predict_proba(_matrix(lib_feats, FEATURE_ORDER))[:, 1])
+                 else np.asarray(self.lib_model.predict(_matrix(lib_feats, FEATURE_ORDER))))
         p_ret = (np.full(n, self.ret_rate) if self.ret_model is None
-                 else self.ret_model.predict_proba(_matrix(ret_feats, RETRIEVAL_FEATURE_ORDER))[:, 1])
+                 else np.asarray(self.ret_model.predict(_matrix(ret_feats, RETRIEVAL_FEATURE_ORDER))))
         return p_lib, p_ret
 
 
