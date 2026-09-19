@@ -31,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
-from casmi26.data import LoadConfig, rows_to_spectra, sample_structures, scan_train
+from casmi26.data import (LoadConfig, rows_to_spectra, sample_structures, scan_train,
+                          structure_catalogue)
 from casmi26.fusion import fuse_hits, gate_features, rank_candidates
 from casmi26.gate import (DualGate, dual_merge, fill_slots, oracle_merge,
                           retrieval_features)
@@ -84,7 +85,13 @@ def main() -> int:
     ap.add_argument("--checkpoint", default=None,
                     help="fingerprint model; omitted = library search only")
     ap.add_argument("--structures", type=int, default=30000,
-                    help="structures sampled to build library + database")
+                    help="structures sampled to build the SPECTRAL LIBRARY")
+    ap.add_argument("--full-database", action="store_true", default=True,
+                    help="use every structure in train.parquet as the candidate "
+                         "database, not just the sampled ones (default on)")
+    ap.add_argument("--sampled-database", dest="full_database", action="store_false",
+                    help="restrict the candidate database to the sampled "
+                         "structures -- makes class-2 look far easier than it is")
     ap.add_argument("--val-molecules", type=int, default=600)
     ap.add_argument("--max-spectra-per-structure", type=int, default=6)
     ap.add_argument("--proportions", type=str, default="0.4,0.4,0.2",
@@ -164,11 +171,27 @@ def main() -> int:
     library = SpectralLibrary.build(lib_specs)
     print(f"library built ({time.time()-t0:.0f}s)")
 
-    # ---- candidate database: everything except class-3 val structures --------
-    db_keys = [k for k in all_keys if k not in splits or splits[k].in_database]
-    db_smiles = [smiles_of[k] for k in db_keys]
-    db_mass = np.array([by_key[k][0]["precursor_mz"] for k in db_keys])
-    db_formula = np.array([by_key[k][0].get("formula") or "" for k in db_keys])
+    # ---- candidate database: sized independently of the library -------------
+    if a.full_database:
+        cat = structure_catalogue(a.train_parquet)
+        cat_keys = cat["inchikey14"].to_list()
+        cat_smiles = cat["normalized_smiles"].to_list()
+        cat_formula = [f or "" for f in cat["molecular_formula"].to_list()]
+        drop = {k for k, v in splits.items() if not v.in_database}
+        keep = [i for i, k in enumerate(cat_keys) if k not in drop]
+        db_keys = [cat_keys[i] for i in keep]
+        db_smiles = [cat_smiles[i] for i in keep]
+        db_formula = np.array([cat_formula[i] for i in keep])
+        db_mass = np.zeros(len(db_keys))  # unused when pooling by formula
+        print(f"candidate database: {len(db_keys)} structures "
+              f"(full catalogue from train.parquet)")
+    else:
+        db_keys = [k for k in all_keys if k not in splits or splits[k].in_database]
+        db_smiles = [smiles_of[k] for k in db_keys]
+        db_mass = np.array([by_key[k][0]["precursor_mz"] for k in db_keys])
+        db_formula = np.array([by_key[k][0].get("formula") or "" for k in db_keys])
+        print(f"candidate database: {len(db_keys)} sampled structures "
+              f"(class-2 numbers from this are optimistic)")
 
     model = cfg = None
     db_fp = None
@@ -178,10 +201,9 @@ def main() -> int:
         model, cfg = load_model(a.checkpoint, device)
         from casmi26.torch_data import morgan_bits
         db_fp = np.stack([morgan_bits(s, cfg.fp_bits) for s in db_smiles])
-        print(f"database: {len(db_keys)} structures, fingerprints built "
-              f"({time.time()-t0:.0f}s)")
+        print(f"database fingerprints built ({time.time()-t0:.0f}s)")
     else:
-        print(f"database: {len(db_keys)} structures (no model -> retrieval disabled)")
+        print("no checkpoint -> retrieval disabled, library search only")
 
     filler = db_smiles[:40]
     molecules, answers = [], {}

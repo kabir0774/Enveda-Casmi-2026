@@ -65,8 +65,9 @@ class SpectralLibrary:
 
     def search(self, queries: list[dict], top_k: int = 200,
                bin_cfg: BinConfig = BinConfig(), clean_cfg: CleanConfig = CleanConfig(),
-               loss_weight: float = 0.5, block: int = 256,
-               precursor_tol: float | None = None) -> list[list[Hit]]:
+               loss_weight: float = 0.5, block: int | None = None,
+               precursor_tol: float | None = None,
+               max_block_bytes: int = 512 * 1024 * 1024) -> list[list[Hit]]:
         """Top-k library rows per query spectrum, fragment + loss channels fused.
 
         `precursor_tol` (in Da) restricts hits to library entries of nearly the
@@ -82,6 +83,13 @@ class SpectralLibrary:
         Q_frag = stack_to_csr(frag_rows, bin_cfg.n_bins)
         Q_loss = stack_to_csr(loss_rows, bin_cfg.n_bins)
         qprec = np.asarray(qprec, dtype=np.float64)
+
+        # The score block is dense: block x n_library float64. At 1.9M library
+        # spectra a block of 256 is 4 GB per channel, which is how a search that
+        # worked at 100k library spectra kills the machine at full scale.
+        if block is None:
+            per_row = self.n * 8 * 2  # two channels, float64
+            block = max(1, min(256, max_block_bytes // max(per_row, 1)))
 
         out: list[list[Hit]] = []
         for start in range(0, Q_frag.shape[0], block):

@@ -195,3 +195,26 @@ def dataset_summary(lf: pl.LazyFrame) -> pl.DataFrame:
                    pl.col("precursor_mz").median().alias("median_precursor_mz"))
               .sort("spectra", descending=True)
               .collect())
+
+
+def structure_catalogue(path: str | Path, cfg: LoadConfig | None = None) -> pl.DataFrame:
+    """Every distinct structure in train.parquet: key, SMILES, formula.
+
+    Three columns and one row per structure, so this is cheap even though the
+    file is 2.9 GB -- parquet only reads the columns asked for.
+
+    This exists because the candidate database and the spectral library are
+    different things and must be sized separately. A library is limited by how
+    many spectra you can afford to search; a database is just a list of
+    structures. Sampling 30k structures for both makes a molecular-formula pool
+    about 3 candidates wide, which turns class-2 retrieval into a coin flip
+    that looks like a triumph.
+    """
+    lf = pl.scan_parquet(str(path)).select(
+        available(path, ["inchikey14", "normalized_smiles", "molecular_formula"]))
+    if cfg is not None and cfg.max_precursor_error_ppm is not None:
+        pass  # filtering on ppm would need that column; catalogue stays permissive
+    return (lf.group_by("inchikey14")
+              .agg(pl.col("normalized_smiles").first(),
+                   pl.col("molecular_formula").first())
+              .collect())
