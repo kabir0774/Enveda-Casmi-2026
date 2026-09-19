@@ -89,9 +89,16 @@ def main() -> int:
     ap.add_argument("--max-spectra-per-structure", type=int, default=6)
     ap.add_argument("--proportions", type=str, default="0.4,0.4,0.2",
                     help="assumed class 1,2,3 mix -- the real one is hidden")
+    ap.add_argument("--pool-by", choices=["formula", "mass"], default="formula",
+                    help="how the candidate pool is formed. formula = every "
+                         "database structure with the same molecular formula "
+                         "(realistic). mass = a precursor-mass window (gives an "
+                         "unrealistically small pool)")
     ap.add_argument("--mass-tol", type=float, default=0.01,
-                    help="Da window for the candidate pool (stands in for a "
-                         "molecular-formula filter)")
+                    help="Da window, used only with --pool-by mass")
+    ap.add_argument("--query-spectra", type=int, default=3,
+                    help="spectra per validation molecule used as the query; "
+                         "these are always excluded from the library")
     ap.add_argument("--top-k-library", type=int, default=150)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
@@ -120,10 +127,40 @@ def main() -> int:
     mix = {c: sum(1 for v in splits.values() if v.novelty_class == c) for c in (1, 2, 3)}
     print(f"val molecules: {len(val_keys)}  class mix {mix}  (assumed {props})")
 
-    # ---- library: every structure except the class-2 and class-3 val ones ----
-    hidden = {k for k, v in splits.items() if not v.in_library}
-    lib_specs = [s for s in spectra if s["key"] not in hidden]
-    print(f"library: {len(lib_specs)} spectra  (hiding {len(hidden)} val structures)")
+    # ---- query / library split -------------------------------------------
+    # The query spectra of a validation molecule must NEVER be in the library.
+    # Otherwise class-1 search finds a cosine-1.0 self-match and scores a
+    # perfect 1.0000, which is a lookup of the identical measurement, not
+    # library search. In the real competition the test spectra are fresh
+    # acquisitions the library has never seen.
+    #
+    # Class 1 keeps its OTHER spectra in the library (that is what "reference
+    # spectra exist" means). Classes 2 and 3 have all their spectra hidden.
+    queries: dict[str, list[dict]] = {}
+    keep_in_library: list[dict] = []
+    demoted = 0
+    for k in val_keys:
+        specs = by_key[k]
+        n_query = max(1, min(a.query_spectra, len(specs) - 1)) if len(specs) > 1 else 1
+        queries[k] = specs[:n_query]
+        rest = specs[n_query:]
+        if splits[k].in_library:
+            if rest:
+                keep_in_library.extend(rest)
+            else:
+                # only one spectrum: no reference left, so it cannot be class 1
+                splits[k].novelty_class = 2
+                splits[k].in_library = False
+                demoted += 1
+    val_set = set(val_keys)
+    lib_specs = [s for s in spectra if s["key"] not in val_set] + keep_in_library
+    if demoted:
+        print(f"demoted {demoted} class-1 molecules to class 2 "
+              f"(only one spectrum, nothing left for the library)")
+    mix = {c: sum(1 for v in splits.values() if v.novelty_class == c) for c in (1, 2, 3)}
+    print(f"library: {len(lib_specs)} spectra "
+          f"({len(keep_in_library)} of them other spectra of class-1 val molecules); "
+          f"final class mix {mix}")
     library = SpectralLibrary.build(lib_specs)
     print(f"library built ({time.time()-t0:.0f}s)")
 
@@ -131,6 +168,7 @@ def main() -> int:
     db_keys = [k for k in all_keys if k not in splits or splits[k].in_database]
     db_smiles = [smiles_of[k] for k in db_keys]
     db_mass = np.array([by_key[k][0]["precursor_mz"] for k in db_keys])
+    db_formula = np.array([by_key[k][0].get("formula") or "" for k in db_keys])
 
     model = cfg = None
     db_fp = None
@@ -147,8 +185,9 @@ def main() -> int:
 
     filler = db_smiles[:40]
     molecules, answers = [], {}
+    pool_sizes = []
     for n, key in enumerate(val_keys):
-        qspecs = by_key[key]
+        qspecs = queries[key]
         hits = library.search(qspecs, top_k=a.top_k_library)
         cands = fuse_hits(hits, library)
         lib_list = rank_candidates(cands, k=25)
@@ -163,7 +202,15 @@ def main() -> int:
         ret_list, ret_feats = [], retrieval_features(np.zeros(0), 0, meta["precursor_mz"])
         if model is not None:
             pred = predict_fingerprints(model, qspecs, device, cfg.fp_bits).mean(axis=0)
-            pool = np.flatnonzero(np.abs(db_mass - qspecs[0]["precursor_mz"]) <= a.mass_tol)
+            # Candidate pool. Formula matching is the realistic filter -- it is
+            # what SIRIUS-style pipelines do -- and it is what the real class-2
+            # task faces. A narrow precursor-mass window instead produces a pool
+            # of one or two candidates and a meaninglessly high class-2 score.
+            if a.pool_by == "formula" and qspecs[0].get("formula"):
+                pool = np.flatnonzero(db_formula == qspecs[0]["formula"])
+            else:
+                pool = np.flatnonzero(np.abs(db_mass - qspecs[0]["precursor_mz"]) <= a.mass_tol)
+            pool_sizes.append(int(pool.size))
             if pool.size:
                 sims = tanimoto(pred, db_fp[pool])
                 order = pool[np.argsort(sims)[::-1][:25]]
@@ -207,19 +254,29 @@ def main() -> int:
             m["id"]: fill_slots(dual_merge(m["library"], m["retrieval"], float(pl), float(pr),
                                            pin_winner=False), m["filler"])
             for m, pl, pr in zip(gtest, p_lib, p_ret)})
-        results["oracle source"] = report_by_class(
+        results["best-source oracle"] = report_by_class(
             per_molecule_rr(oracle_merge(gtest, test_answers, mrr_at_k, inchikey14)["predictions"],
                             test_answers), test_splits)
 
-    print(f"\n{'policy':<18} {'MRR@25':>8} {'class1':>8} {'class2':>8} {'class3':>8}")
-    print("-" * 54)
+    if pool_sizes:
+        ps = np.array(pool_sizes)
+        print(f"\ncandidate pool per molecule ({a.pool_by}): median {int(np.median(ps))}, "
+              f"mean {ps.mean():.0f}, max {ps.max()}, empty for {(ps == 0).sum()} molecules")
+        print("  NOTE: the real class-2 task searches PubChem/COCONUT, where a "
+              "formula pool is typically 10^2-10^4 candidates. A small pool here "
+              "makes class-2 look far easier than it is.")
+
+    print(f"\n{'policy':<20} {'MRR@25':>8} {'class1':>8} {'class2':>8} {'class3':>8}")
+    print("-" * 56)
     for name, r in results.items():
-        print(f"{name:<18} {r['mrr_overall']:>8.4f} {r['mrr_class1']:>8.4f} "
+        print(f"{name:<20} {r['mrr_overall']:>8.4f} {r['mrr_class1']:>8.4f} "
               f"{r['mrr_class2']:>8.4f} {r['mrr_class3']:>8.4f}")
     n = int(results["library only"]["n_molecules"])
     se = results["library only"].get("se", 0.0)
-    print("-" * 54)
+    print("-" * 56)
     print(f"n = {n} molecules, SE ~ {se:.4f}")
+    print("best-source oracle picks which LIST goes first; it is not an upper "
+          "bound over all merges, so a blend can legitimately beat it.")
     print(f"public leaderboard for reference: herd 0.339, top 0.362 (19 Sep 2026)")
     print(f"\ntotal {time.time()-t0:.0f}s")
 
