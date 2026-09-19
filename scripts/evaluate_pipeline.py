@@ -37,6 +37,7 @@ from casmi26.fusion import fuse_hits, gate_features, rank_candidates
 from casmi26.gate import (DualGate, dual_merge, fill_slots, oracle_merge,
                           retrieval_features)
 from casmi26.library import SpectralLibrary
+from casmi26.preprocess import BinConfig
 from casmi26.metric import inchikey14, mrr_at_k, per_molecule_rr, validate_submission
 from casmi26.splits import build_splits, group_kfold_by_key, report_by_class
 
@@ -107,6 +108,11 @@ def main() -> int:
                     help="spectra per validation molecule used as the query; "
                          "these are always excluded from the library")
     ap.add_argument("--top-k-library", type=int, default=150)
+    ap.add_argument("--mz-power", type=float, default=0.0,
+                    help="weight peaks by (m/z)**p in library search. 0 = plain "
+                         "cosine; 2 = NIST-style weighting of heavy fragments")
+    ap.add_argument("--loss-weight", type=float, default=0.5,
+                    help="weight of the neutral-loss channel relative to fragments")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -184,8 +190,10 @@ def main() -> int:
     print(f"library: {len(lib_specs)} spectra "
           f"({len(keep_in_library)} of them other spectra of class-1 val molecules); "
           f"final class mix {mix}")
-    library = SpectralLibrary.build(lib_specs)
-    print(f"library built ({time.time()-t0:.0f}s)")
+    bin_cfg = BinConfig(mz_power=a.mz_power)
+    library = SpectralLibrary.build(lib_specs, bin_cfg=bin_cfg)
+    print(f"library built ({time.time()-t0:.0f}s, mz_power={a.mz_power}, "
+          f"loss_weight={a.loss_weight})")
 
     # ---- candidate database: sized independently of the library -------------
     if a.full_database:
@@ -251,9 +259,11 @@ def main() -> int:
     molecules, answers = [], {}
     pool_sizes = []
     class1_ranks: list[int] = []
+    class1_full_ranks: list[int] = []
     for n, key in enumerate(val_keys):
         qspecs = queries[key]
-        hits = library.search(qspecs, top_k=a.top_k_library)
+        hits = library.search(qspecs, top_k=a.top_k_library,
+                              loss_weight=a.loss_weight)
         cands = fuse_hits(hits, library)
         lib_list = rank_candidates(cands, k=25)
 
@@ -287,6 +297,12 @@ def main() -> int:
             rank = next((i for i, s in enumerate(lib_list, 1)
                          if inchikey14(s) == target), None)
             class1_ranks.append(rank if rank else 0)
+            # Rank in the FULL fused candidate list, before truncation to 25.
+            # Separates "search never retrieved it" from "search found it and
+            # fusion ranked it out of the top 25" -- different fixes.
+            full = next((i for i, c in enumerate(cands, 1)
+                         if inchikey14(c.smiles) == target), None)
+            class1_full_ranks.append(full if full else 0)
 
         molecules.append({"id": key, "features": feats, "ret_features": ret_feats,
                           "library": lib_list, "retrieval": ret_list, "filler": filler})
@@ -335,9 +351,17 @@ def main() -> int:
         print(f"\nclass-1 library search: correct structure in the top 25 for "
               f"{found.sum()}/{len(r)} molecules; of those, rank 1 for "
               f"{(r == 1).sum()}, median rank {int(np.median(r[found])) if found.any() else 0}")
-        print("  If recall is high but rank-1 is low, the similarity SCORING is "
-              "the problem, not the search. If recall itself is low, the library "
-              "does not contain a usable reference.")
+        fr = np.array(class1_full_ranks)
+        ff = fr > 0
+        print(f"  in the FULL candidate list (before truncating to 25): "
+              f"{ff.sum()}/{len(fr)}, median rank "
+              f"{int(np.median(fr[ff])) if ff.any() else 0}")
+        print(f"  -> retrieved but ranked out of the top 25: "
+              f"{int(ff.sum() - found.sum())} molecules")
+        print(f"  -> never retrieved at all: {int(len(fr) - ff.sum())} molecules")
+        now = float((1.0 / np.where(r > 0, r, 1e9)).sum() / max(len(r), 1))
+        print(f"  ceiling if ranking were perfect: class-1 MRR "
+              f"{ff.sum()/max(len(fr),1):.4f}  (currently {now:.4f})")
 
     if pool_sizes:
         ps = np.array(pool_sizes)

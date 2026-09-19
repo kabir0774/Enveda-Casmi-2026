@@ -36,7 +36,8 @@ class SpectralLibrary:
 
     def __init__(self, keys: np.ndarray, smiles: np.ndarray,
                  precursor_mz: np.ndarray,
-                 frag: sparse.csr_matrix, loss: sparse.csr_matrix):
+                 frag: sparse.csr_matrix, loss: sparse.csr_matrix,
+                 bin_cfg: BinConfig | None = None):
         assert frag.shape[0] == loss.shape[0] == len(keys) == len(smiles)
         self.keys = np.asarray(keys)
         self.smiles = np.asarray(smiles)
@@ -44,6 +45,7 @@ class SpectralLibrary:
         self.frag = frag.T.tocsr()   # transposed once: (n_bins, n_lib)
         self.loss = loss.T.tocsr()
         self.n = len(keys)
+        self.bin_cfg = bin_cfg or BinConfig()
 
     @classmethod
     def build(cls, spectra: list[dict], bin_cfg: BinConfig = BinConfig(),
@@ -61,10 +63,10 @@ class SpectralLibrary:
             prec.append(s["precursor_mz"])
         frag = stack_to_csr(frag_rows, bin_cfg.n_bins)
         loss = stack_to_csr(loss_rows, bin_cfg.n_bins)
-        return cls(np.array(keys), np.array(smis), np.array(prec), frag, loss)
+        return cls(np.array(keys), np.array(smis), np.array(prec), frag, loss, bin_cfg)
 
     def search(self, queries: list[dict], top_k: int = 200,
-               bin_cfg: BinConfig = BinConfig(), clean_cfg: CleanConfig = CleanConfig(),
+               bin_cfg: BinConfig | None = None, clean_cfg: CleanConfig = CleanConfig(),
                loss_weight: float = 0.5, block: int | None = None,
                precursor_tol: float | None = None,
                max_block_bytes: int = 512 * 1024 * 1024) -> list[list[Hit]]:
@@ -74,6 +76,10 @@ class SpectralLibrary:
         same precursor mass -- that is the exact-match regime. Leave it None
         for analogue search, where the mass is allowed to differ.
         """
+        # Queries must be binned exactly as the library was, or the weighting
+        # differs between the two sides of the dot product and every score is
+        # wrong in a way that still looks plausible.
+        bin_cfg = bin_cfg or self.bin_cfg
         frag_rows, loss_rows, qprec = [], [], []
         for q in queries:
             mz, it = clean_peaks(q["mzs"], q["intensities"], q["precursor_mz"], clean_cfg)

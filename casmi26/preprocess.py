@@ -38,6 +38,16 @@ class CleanConfig:
 class BinConfig:
     bin_size: float = 0.05
     max_mz: float = 1200.0
+    mz_power: float = 0.0
+    """Weight each peak by (m/z) ** mz_power before scoring.
+
+    Plain cosine treats a 91 Da tropylium fragment -- which half of all
+    aromatics produce -- as being as informative as a 437 Da fragment that
+    almost uniquely identifies a scaffold. Heavy fragments carry far more
+    structural information, and up-weighting them is standard in library
+    search (NIST-style weighting uses roughly mz**2 with sqrt intensities).
+    0.0 reproduces plain cosine.
+    """
 
     @property
     def n_bins(self) -> int:
@@ -153,6 +163,8 @@ def to_bins(mzs, ints, cfg: BinConfig = BinConfig()) -> tuple[np.ndarray, np.nda
     mzs, ints = mzs[keep], ints[keep]
     if mzs.size == 0:
         return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32)
+    if cfg.mz_power:
+        ints = ints * np.power(np.clip(mzs, 1.0, None), cfg.mz_power)
     idx = np.rint(mzs / cfg.bin_size).astype(np.int32)
     order = np.argsort(idx)
     idx, vals = idx[order], ints[order]
@@ -163,11 +175,20 @@ def to_bins(mzs, ints, cfg: BinConfig = BinConfig()) -> tuple[np.ndarray, np.nda
 
 def neutral_loss_bins(mzs, ints, precursor_mz: float,
                       cfg: BinConfig = BinConfig()) -> tuple[np.ndarray, np.ndarray]:
-    """Bin the losses (precursor - fragment) instead of the fragments."""
-    losses = np.asarray(precursor_mz, dtype=np.float64) - np.asarray(mzs, dtype=np.float64)
+    """Bin the losses (precursor - fragment) instead of the fragments.
+
+    Weighting is applied on the FRAGMENT mass, not the loss: a small loss from
+    a large fragment is informative, and weighting by the loss would penalise
+    exactly those.
+    """
+    mzs = np.asarray(mzs, dtype=np.float64)
     ints = np.asarray(ints, dtype=np.float64)
+    if cfg.mz_power:
+        ints = ints * np.power(np.clip(mzs, 1.0, None), cfg.mz_power)
+    losses = float(precursor_mz) - mzs
     keep = losses >= 0
-    return to_bins(losses[keep], ints[keep], cfg)
+    flat = BinConfig(bin_size=cfg.bin_size, max_mz=cfg.max_mz, mz_power=0.0)
+    return to_bins(losses[keep], ints[keep], flat)
 
 
 def stack_to_csr(rows: list[tuple[np.ndarray, np.ndarray]], n_bins: int,
