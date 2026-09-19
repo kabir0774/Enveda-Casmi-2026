@@ -189,6 +189,7 @@ def main() -> int:
 
     # ---- candidate database: sized independently of the library -------------
     if a.full_database:
+        print("building candidate database from the full structure catalogue...")
         cat = structure_catalogue(a.train_parquet)
         cat_keys = cat["inchikey14"].to_list()
         cat_smiles = cat["normalized_smiles"].to_list()
@@ -202,9 +203,24 @@ def main() -> int:
         drop_metric = {inchikey14(smiles_of[k]) for k in drop_file_keys
                        if k in smiles_of}
         drop_metric.discard(None)
-        keep = [i for i, k in enumerate(cat_keys)
-                if k not in drop_file_keys
-                and inchikey14(cat_smiles[i]) not in drop_metric]
+        # Only a structure with the SAME MOLECULAR FORMULA can be a tautomer of
+        # a dropped one, and tautomer canonicalisation costs ~10 ms. Running it
+        # over all 275k catalogue entries takes about 45 minutes; restricting it
+        # to same-formula entries takes about a minute.
+        drop_formulas = {(by_key[k][0].get("formula") or "") for k in drop_file_keys
+                         if k in by_key}
+        drop_formulas.discard("")
+        keep, checked = [], 0
+        for i, k in enumerate(cat_keys):
+            if k in drop_file_keys:
+                continue
+            if cat_formula[i] in drop_formulas:
+                checked += 1
+                if inchikey14(cat_smiles[i]) in drop_metric:
+                    continue
+            keep.append(i)
+        print(f"  tautomer check ran on {checked} same-formula entries "
+              f"(of {len(cat_keys)}), {time.time()-t0:.0f}s")
         db_keys = [cat_keys[i] for i in keep]
         db_smiles = [cat_smiles[i] for i in keep]
         db_formula = np.array([cat_formula[i] for i in keep])
