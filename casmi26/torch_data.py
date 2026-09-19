@@ -51,7 +51,8 @@ class SpectrumFingerprintDataset(Dataset):
     """
 
     def __init__(self, spectra: list[dict], cfg: DataConfig = DataConfig(),
-                 with_targets: bool = True):
+                 with_targets: bool = True, precompute: bool = True,
+                 verbose: bool = False):
         self.cfg = cfg
         self.with_targets = with_targets
         self.items = []
@@ -62,17 +63,56 @@ class SpectrumFingerprintDataset(Dataset):
                     continue
             self.items.append(s)
 
-    def __len__(self) -> int:
-        return len(self.items)
+        # Fingerprints are stored once per STRUCTURE, bit-packed. Holding one
+        # float32 vector per spectrum would be ~8 KB x 2.5M = 20 GB; packed per
+        # structure it is 256 bytes x 275k = 70 MB.
+        self.key_index: dict[str, int] = {}
+        self.fp_packed: np.ndarray | None = None
+        self.item_fp: np.ndarray | None = None
+        if with_targets:
+            packed = []
+            item_fp = np.zeros(len(self.items), dtype=np.int64)
+            for i, s in enumerate(self.items):
+                key = s.get("key") or s["smiles"]
+                j = self.key_index.get(key)
+                if j is None:
+                    j = len(packed)
+                    self.key_index[key] = j
+                    packed.append(np.packbits(
+                        morgan_bits(s["smiles"], cfg.fp_bits, cfg.fp_radius).astype(np.uint8)))
+                item_fp[i] = j
+            self.fp_packed = np.stack(packed) if packed else None
+            self.item_fp = item_fp
 
-    def __getitem__(self, i: int):
-        s = self.items[i]
+        # Cleaning is the expensive part and it does not change between epochs.
+        # Doing it once here turns every later epoch into pure tensor assembly.
+        self.cleaned: list[tuple[np.ndarray, np.ndarray]] | None = None
+        if precompute:
+            self.cleaned = []
+            for n, s in enumerate(self.items):
+                self.cleaned.append(self._clean(s))
+                if verbose and n and n % 200_000 == 0:
+                    print(f"  precomputed {n}/{len(self.items)} spectra")
+
+    def _clean(self, s: dict) -> tuple[np.ndarray, np.ndarray]:
         cfg = self.cfg
         mz, it = clean_peaks(s["mzs"], s["intensities"], s["precursor_mz"], cfg.clean)
         if mz.size > cfg.max_peaks:
             keep = np.argsort(it)[::-1][: cfg.max_peaks]
             keep.sort()
             mz, it = mz[keep], it[keep]
+        return mz.astype(np.float32), it.astype(np.float32)
+
+    def fingerprint_for(self, i: int) -> np.ndarray:
+        bits = np.unpackbits(self.fp_packed[self.item_fp[i]])[: self.cfg.fp_bits]
+        return bits.astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, i: int):
+        s = self.items[i]
+        mz, it = self.cleaned[i] if self.cleaned is not None else self._clean(s)
         out = {
             "mzs": torch.tensor(mz, dtype=torch.float32),
             "intensities": torch.tensor(it, dtype=torch.float32),
@@ -87,8 +127,7 @@ class SpectrumFingerprintDataset(Dataset):
             "molecule_id": s.get("molecule_id", ""),
         }
         if self.with_targets:
-            fp = morgan_bits(s["smiles"], cfg.fp_bits, cfg.fp_radius)
-            out["fp"] = torch.tensor(fp, dtype=torch.float32)
+            out["fp"] = torch.from_numpy(self.fingerprint_for(i))
             out["neutral_mass"] = torch.tensor(float(s["precursor_mz"]) - 1.007276,
                                                dtype=torch.float32)
         return out

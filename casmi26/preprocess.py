@@ -96,15 +96,27 @@ def clean_peaks(mzs, intensities, precursor_mz: float,
 
 
 def _deisotope(mzs, ints, tol):
-    """Drop a peak that sits ~1.0034 Da above a more intense peak."""
-    keep = np.ones(mzs.size, dtype=bool)
-    for i in range(mzs.size):
+    """Drop a peak that sits ~1.0034 Da above a more intense peak.
+
+    Vectorised: the per-peak isotope window is found with one searchsorted over
+    the whole array, and only the few peaks that actually have a partner enter
+    a Python loop. On real spectra with hundreds of peaks this is the
+    difference between preprocessing being free and it dominating training.
+    """
+    n = mzs.size
+    if n < 2:
+        return mzs, ints
+    targets = mzs + C13_C12
+    lo = np.searchsorted(mzs, targets - tol)
+    hi = np.searchsorted(mzs, targets + tol)
+    has_partner = np.flatnonzero(hi > lo)
+    if has_partner.size == 0:
+        return mzs, ints
+    keep = np.ones(n, dtype=bool)
+    for i in has_partner:
         if not keep[i]:
             continue
-        target = mzs[i] + C13_C12
-        lo = np.searchsorted(mzs, target - tol)
-        hi = np.searchsorted(mzs, target + tol)
-        for j in range(lo, hi):
+        for j in range(lo[i], hi[i]):
             if j != i and ints[j] <= ints[i]:
                 keep[j] = False
     return mzs[keep], ints[keep]
@@ -115,18 +127,21 @@ def _window_top_n(mzs, ints, window, n):
 
     Preserves informative low-mass fragments that a global top-N throws away
     because they are dim next to the base peak.
+
+    Vectorised with a lexsort: peaks are ordered by (window, -intensity) and
+    each peak's position within its own window is read off a cumulative count,
+    so no per-window Python loop is needed.
     """
     if mzs.size == 0:
         return mzs, ints
     bucket = np.floor(mzs / window).astype(np.int64)
+    order = np.lexsort((-ints, bucket))
+    sorted_bucket = bucket[order]
+    # position of each element within its bucket, after sorting by intensity
+    starts = np.flatnonzero(np.r_[True, sorted_bucket[1:] != sorted_bucket[:-1]])
+    within = np.arange(sorted_bucket.size) - np.repeat(starts, np.diff(np.r_[starts, sorted_bucket.size]))
     keep = np.zeros(mzs.size, dtype=bool)
-    for b in np.unique(bucket):
-        idx = np.flatnonzero(bucket == b)
-        if idx.size <= n:
-            keep[idx] = True
-        else:
-            top = idx[np.argsort(ints[idx])[::-1][:n]]
-            keep[top] = True
+    keep[order[within < n]] = True
     return mzs[keep], ints[keep]
 
 

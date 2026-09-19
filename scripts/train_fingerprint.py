@@ -116,7 +116,7 @@ def main() -> int:
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--fp-bits", type=int, default=2048)
     ap.add_argument("--max-peaks", type=int, default=128)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default="runs/fp")
     ap.add_argument("--amp", action="store_true", default=True)
@@ -140,14 +140,16 @@ def main() -> int:
 
     train_sp, val_sp = split_by_key(spectra, 0.15, args.seed)
     dcfg = DataConfig(max_peaks=args.max_peaks, fp_bits=args.fp_bits)
-    train_ds = SpectrumFingerprintDataset(train_sp, dcfg)
-    val_ds = SpectrumFingerprintDataset(val_sp, dcfg)
+    print("preprocessing (once, cached for every epoch)...")
+    train_ds = SpectrumFingerprintDataset(train_sp, dcfg, verbose=True)
+    val_ds = SpectrumFingerprintDataset(val_sp, dcfg, verbose=True)
     # retrieval_eval needs the true fingerprint per structure
     for ds in (train_ds, val_ds):
         ds.key_to_fp = {s["key"]: morgan_bits(s["smiles"], args.fp_bits)
                         for s in ds.items}
     print(f"train {len(train_ds)} spectra / {len(train_ds.key_to_fp)} structures | "
-          f"val {len(val_ds)} spectra / {len(val_ds.key_to_fp)} structures")
+          f"val {len(val_ds)} spectra / {len(val_ds.key_to_fp)} structures "
+          f"({time.time()-t0:.0f}s elapsed)")
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                           collate_fn=collate, num_workers=args.workers,
