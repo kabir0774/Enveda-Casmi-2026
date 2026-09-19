@@ -73,8 +73,12 @@ class PeakFormer(nn.Module):
 
         self.adduct_emb = nn.Embedding(cfg.n_adducts, cfg.d_model)
         self.mode_emb = nn.Embedding(2, cfg.d_model)
+        # +1 for the collision-energy-known flag. 14.8% of training spectra
+        # have a null collision_energy_ev, and encoding those as 0.0 would tell
+        # the model "this was acquired at zero volts", which is a lie it will
+        # happily learn. An explicit flag lets it treat them as unknown.
         self.global_proj = nn.Sequential(
-            nn.Linear(self.mz_enc.out_dim + 2, cfg.d_model), nn.GELU(),
+            nn.Linear(self.mz_enc.out_dim + 3, cfg.d_model), nn.GELU(),
             nn.Linear(cfg.d_model, cfg.d_model))
         self.cls = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         nn.init.normal_(self.cls, std=0.02)
@@ -93,12 +97,17 @@ class PeakFormer(nn.Module):
         self.mass_head = nn.Linear(cfg.d_model, 1)
 
     def forward(self, mzs, intensities, mask, precursor_mz, adduct_id,
-                mode_id, collision_energy):
+                mode_id, collision_energy, ce_known=None):
         """
         mzs, intensities, mask: (B, L)   mask True = real peak
         precursor_mz, collision_energy:  (B,)
         adduct_id, mode_id:              (B,) long
+        ce_known:                        (B,) 1.0 where collision energy is
+                                         real, 0.0 where it was null. Defaults
+                                         to all-known.
         """
+        if ce_known is None:
+            ce_known = torch.ones_like(precursor_mz)
         losses = (precursor_mz.unsqueeze(1) - mzs).clamp(min=0.0)
         peak_feats = torch.cat([
             self.mz_enc(mzs),
@@ -110,8 +119,9 @@ class PeakFormer(nn.Module):
 
         g = self.global_proj(torch.cat([
             self.mz_enc(precursor_mz.unsqueeze(1)).squeeze(1),
-            (collision_energy / 100.0).unsqueeze(-1),
+            (collision_energy / 100.0).unsqueeze(-1) * ce_known.unsqueeze(-1),
             (precursor_mz / 1000.0).unsqueeze(-1),
+            ce_known.unsqueeze(-1),
         ], dim=-1))
         g = g + self.adduct_emb(adduct_id) + self.mode_emb(mode_id)
 

@@ -123,6 +123,8 @@ class SpectrumFingerprintDataset(Dataset):
                                     dtype=torch.long),
             "collision_energy": torch.tensor(float(s.get("collision_energy_ev") or 0.0),
                                              dtype=torch.float32),
+            "ce_known": torch.tensor(0.0 if s.get("collision_energy_ev") in (None, 0, 0.0)
+                                     else 1.0, dtype=torch.float32),
             "key": s.get("key", ""),
             "molecule_id": s.get("molecule_id", ""),
         }
@@ -151,6 +153,7 @@ def collate(batch: list[dict]) -> dict:
         "adduct_id": torch.stack([b["adduct_id"] for b in batch]),
         "mode_id": torch.stack([b["mode_id"] for b in batch]),
         "collision_energy": torch.stack([b["collision_energy"] for b in batch]),
+        "ce_known": torch.stack([b["ce_known"] for b in batch]),
         "keys": [b["key"] for b in batch],
         "molecule_ids": [b["molecule_id"] for b in batch],
     }

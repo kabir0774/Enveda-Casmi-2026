@@ -117,13 +117,18 @@ def scan_test(path: str | Path) -> pl.LazyFrame:
     return pl.scan_parquet(str(path)).select(available(path, TEST_COLUMNS))
 
 
-def _first_or(value, default=0.0) -> float:
-    """collision_energy_ev is a list: [20] is one acquisition, [20,40,60] a merge."""
+def _first_or(value, default=None):
+    """collision_energy_ev is a list: [20] is one acquisition, [20,40,60] a merge.
+
+    Returns None when the source recorded nothing. 14.8% of filtered training
+    spectra are null here, and collapsing those to 0.0 would assert they were
+    acquired at zero volts. The model gets a separate "known" flag instead.
+    """
     if value is None:
-        return float(default)
+        return default
     if isinstance(value, (list, tuple, np.ndarray)):
         arr = [v for v in value if v is not None]
-        return float(np.mean(arr)) if arr else float(default)
+        return float(np.mean(arr)) if arr else default
     return float(value)
 
 
@@ -144,7 +149,7 @@ def rows_to_spectra(df: pl.DataFrame, with_labels: bool = True) -> list[dict]:
             "precursor_mz": float(row["precursor_mz"]),
             "adduct": row.get("adduct"),
             "ionization_mode": row.get("ionization_mode"),
-            "collision_energy_ev": _first_or(row.get("collision_energy_ev"), 0.0),
+            "collision_energy_ev": _first_or(row.get("collision_energy_ev")),
             "base_peak_intensity": float(row.get("base_peak_intensity") or 0.0),
         }
         if with_labels and "normalized_smiles" in cols:

@@ -26,10 +26,11 @@ from casmi26.torch_data import (DataConfig, SpectrumFingerprintDataset, collate,
                                morgan_bits, pos_weight_from)
 
 
-def load_real(path: str, n_structures: int, max_spectra: int, seed: int):
+def load_real(path: str, n_structures: int, max_spectra: int, seed: int,
+              libraries: tuple[str, ...] | None = None):
     import polars as pl
     from casmi26.data import LoadConfig, rows_to_spectra, sample_structures, scan_train
-    lf = scan_train(path, LoadConfig())
+    lf = scan_train(path, LoadConfig(libraries=libraries))
     df = sample_structures(lf, n_structures, seed=seed,
                            max_spectra_per_structure=max_spectra)
     return rows_to_spectra(df, with_labels=True)
@@ -75,7 +76,7 @@ def retrieval_eval(model, loader, device, fp_bits: int, max_molecules: int = 200
         out = model(batch["mzs"].to(device), batch["intensities"].to(device),
                     batch["mask"].to(device), batch["precursor_mz"].to(device),
                     batch["adduct_id"].to(device), batch["mode_id"].to(device),
-                    batch["collision_energy"].to(device))
+                    batch["collision_energy"].to(device), batch["ce_known"].to(device))
         probs = torch.sigmoid(out["fp_logits"]).cpu()
         for i, key in enumerate(batch["keys"]):
             per_mol.setdefault(key, []).append(probs[i])
@@ -106,6 +107,11 @@ def main() -> int:
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--structures", type=int, default=20000)
     ap.add_argument("--max-spectra-per-structure", type=int, default=6)
+    ap.add_argument("--libraries", type=str, default=None,
+                    help="comma-separated ingest_lib names, e.g. gnps,riken,"
+                         "enveda-np-examples for the natural-product subset")
+    ap.add_argument("--init-from", type=str, default=None,
+                    help="checkpoint to warm-start from, for fine-tuning")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -133,8 +139,11 @@ def main() -> int:
         spectra = load_synthetic(args.structures, args.max_spectra_per_structure, args.seed)
         print(f"SYNTHETIC data -- results say nothing about the real competition")
     else:
+        libs = tuple(args.libraries.split(",")) if args.libraries else None
         spectra = load_real(args.train_parquet, args.structures,
-                            args.max_spectra_per_structure, args.seed)
+                            args.max_spectra_per_structure, args.seed, libs)
+        if libs:
+            print(f"libraries: {', '.join(libs)}")
     print(f"{len(spectra)} spectra, {len({s['key'] for s in spectra})} structures "
           f"({time.time()-t0:.1f}s)")
 
@@ -164,6 +173,11 @@ def main() -> int:
     cfg = ModelConfig(d_model=args.d_model, n_layers=args.layers, n_heads=args.heads,
                       d_ff=args.d_model * 4, fp_bits=args.fp_bits, max_peaks=args.max_peaks)
     model = PeakFormer(cfg).to(device)
+    if args.init_from:
+        ck = torch.load(args.init_from, map_location=device)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        print(f"warm-started from {args.init_from} (epoch {ck.get('epoch')}), "
+              f"missing {len(missing)} unexpected {len(unexpected)}")
     print(f"params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -190,7 +204,7 @@ def main() -> int:
                 out = model(batch["mzs"].to(device), batch["intensities"].to(device),
                             batch["mask"].to(device), batch["precursor_mz"].to(device),
                             batch["adduct_id"].to(device), batch["mode_id"].to(device),
-                            batch["collision_energy"].to(device))
+                            batch["collision_energy"].to(device), batch["ce_known"].to(device))
                 fp = batch["fp"].to(device)
                 loss = fingerprint_loss(out["fp_logits"], fp, pw)
                 loss = loss + 0.01 * torch.nn.functional.smooth_l1_loss(
@@ -211,7 +225,7 @@ def main() -> int:
                 out = model(batch["mzs"].to(device), batch["intensities"].to(device),
                             batch["mask"].to(device), batch["precursor_mz"].to(device),
                             batch["adduct_id"].to(device), batch["mode_id"].to(device),
-                            batch["collision_energy"].to(device))
+                            batch["collision_energy"].to(device), batch["ce_known"].to(device))
                 fp = batch["fp"].to(device)
                 vloss += fingerprint_loss(out["fp_logits"], fp, pw).item() * fp.shape[0]
                 vn += fp.shape[0]
