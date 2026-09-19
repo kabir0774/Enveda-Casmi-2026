@@ -258,7 +258,11 @@ def main() -> int:
         if score > best:
             best = score
             torch.save({"model": model.state_dict(), "config": cfg.__dict__,
-                        "args": vars(args), "epoch": epoch, "metrics": rec},
+                        "args": vars(args), "epoch": epoch, "metrics": rec,
+                        # Structures this model has seen. Evaluating retrieval on
+                        # a molecule the fingerprint head was trained on measures
+                        # memorisation, not generalisation.
+                        "train_keys": sorted(train_ds.key_to_fp.keys())},
                        out_dir / "best.pt")
         (out_dir / "history.json").write_text(json.dumps(history, indent=2))
 

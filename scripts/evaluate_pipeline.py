@@ -44,13 +44,13 @@ from casmi26.splits import build_splits, group_kfold_by_key, report_by_class
 def load_model(path: str, device: str):
     import torch
     from casmi26.model import ModelConfig, PeakFormer
-    ck = torch.load(path, map_location=device)
+    ck = torch.load(path, map_location=device, weights_only=False)
     cfg = ModelConfig(**ck["config"])
     model = PeakFormer(cfg).to(device).eval()
     model.load_state_dict(ck["model"])
     print(f"loaded {path} (epoch {ck.get('epoch')}, "
           f"val retrieval top1 {ck.get('metrics', {}).get('retrieval_top1', float('nan')):.4f})")
-    return model, cfg
+    return model, cfg, set(ck.get("train_keys") or [])
 
 
 def predict_fingerprints(model, spectra: list[dict], device: str, fp_bits: int,
@@ -127,8 +127,24 @@ def main() -> int:
     all_keys = sorted(by_key)
     smiles_of = {k: by_key[k][0]["smiles"] for k in all_keys}
 
+    # Structures the fingerprint model was trained on must not become
+    # validation molecules: retrieval would then be scoring memorisation.
+    trained_on: set[str] = set()
+    if a.checkpoint:
+        import torch
+        _ck = torch.load(a.checkpoint, map_location="cpu", weights_only=False)
+        trained_on = set(_ck.get("train_keys") or [])
+        del _ck
+        if not trained_on:
+            print("WARNING: this checkpoint predates train_keys logging, so the "
+                  "model may have been trained on some validation molecules. "
+                  "Retrain to get an honest retrieval number.")
+
+    eligible = [k for k in all_keys if k not in trained_on]
+    print(f"{len(all_keys)} structures, {len(trained_on & set(all_keys))} of them "
+          f"seen by the model -> {len(eligible)} eligible as validation molecules")
     rng = np.random.default_rng(a.seed)
-    val_keys = list(rng.choice(all_keys, size=min(a.val_molecules, len(all_keys)),
+    val_keys = list(rng.choice(eligible, size=min(a.val_molecules, len(eligible)),
                                replace=False))
     splits = build_splits(val_keys, props, seed=a.seed)
     mix = {c: sum(1 for v in splits.values() if v.novelty_class == c) for c in (1, 2, 3)}
@@ -177,8 +193,18 @@ def main() -> int:
         cat_keys = cat["inchikey14"].to_list()
         cat_smiles = cat["normalized_smiles"].to_list()
         cat_formula = [f or "" for f in cat["molecular_formula"].to_list()]
-        drop = {k for k, v in splits.items() if not v.in_database}
-        keep = [i for i, k in enumerate(cat_keys) if k not in drop]
+        # The file's inchikey14 and the metric's are not the same thing: the
+        # metric applies RDKit tautomer canonicalisation first, so two entries
+        # the file calls different can collapse to one key at scoring time. A
+        # class-3 structure excluded by file key can therefore still be present
+        # under a tautomer, which shows up as a non-zero class-3 score.
+        drop_file_keys = {k for k, v in splits.items() if not v.in_database}
+        drop_metric = {inchikey14(smiles_of[k]) for k in drop_file_keys
+                       if k in smiles_of}
+        drop_metric.discard(None)
+        keep = [i for i, k in enumerate(cat_keys)
+                if k not in drop_file_keys
+                and inchikey14(cat_smiles[i]) not in drop_metric]
         db_keys = [cat_keys[i] for i in keep]
         db_smiles = [cat_smiles[i] for i in keep]
         db_formula = np.array([cat_formula[i] for i in keep])
@@ -198,7 +224,7 @@ def main() -> int:
     if a.checkpoint:
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, cfg = load_model(a.checkpoint, device)
+        model, cfg, _ = load_model(a.checkpoint, device)
         from casmi26.torch_data import morgan_bits
         db_fp = np.stack([morgan_bits(s, cfg.fp_bits) for s in db_smiles])
         print(f"database fingerprints built ({time.time()-t0:.0f}s)")
@@ -208,6 +234,7 @@ def main() -> int:
     filler = db_smiles[:40]
     molecules, answers = [], {}
     pool_sizes = []
+    class1_ranks: list[int] = []
     for n, key in enumerate(val_keys):
         qspecs = queries[key]
         hits = library.search(qspecs, top_k=a.top_k_library)
@@ -238,6 +265,12 @@ def main() -> int:
                 order = pool[np.argsort(sims)[::-1][:25]]
                 ret_list = [db_smiles[j] for j in order]
                 ret_feats = retrieval_features(sims, int(pool.size), meta["precursor_mz"])
+
+        if splits[key].novelty_class == 1:
+            target = inchikey14(smiles_of[key])
+            rank = next((i for i, s in enumerate(lib_list, 1)
+                         if inchikey14(s) == target), None)
+            class1_ranks.append(rank if rank else 0)
 
         molecules.append({"id": key, "features": feats, "ret_features": ret_feats,
                           "library": lib_list, "retrieval": ret_list, "filler": filler})
@@ -279,6 +312,16 @@ def main() -> int:
         results["best-source oracle"] = report_by_class(
             per_molecule_rr(oracle_merge(gtest, test_answers, mrr_at_k, inchikey14)["predictions"],
                             test_answers), test_splits)
+
+    if class1_ranks:
+        r = np.array(class1_ranks)
+        found = r > 0
+        print(f"\nclass-1 library search: correct structure in the top 25 for "
+              f"{found.sum()}/{len(r)} molecules; of those, rank 1 for "
+              f"{(r == 1).sum()}, median rank {int(np.median(r[found])) if found.any() else 0}")
+        print("  If recall is high but rank-1 is low, the similarity SCORING is "
+              "the problem, not the search. If recall itself is low, the library "
+              "does not contain a usable reference.")
 
     if pool_sizes:
         ps = np.array(pool_sizes)
