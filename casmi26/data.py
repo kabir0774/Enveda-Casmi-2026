@@ -177,8 +177,19 @@ def sample_structures(lf: pl.LazyFrame, n_structures: int, seed: int = 0,
     structures and 100k spectra answers most questions in minutes, and almost
     nothing you learn at that scale changes at full scale.
     """
-    keys = (lf.select("inchikey14").unique().collect()
-            .sample(n=n_structures, seed=seed, shuffle=True)["inchikey14"])
+    available_keys = lf.select("inchikey14").unique().collect()
+    n_have = available_keys.height
+    if n_structures >= n_have:
+        # Asking for more structures than exist is a reasonable thing to do --
+        # "give me everything" is usually spelled as a big number -- and polars
+        # raises ShapeError rather than returning what it has. Clamp instead.
+        if n_structures > n_have:
+            print(f"  requested {n_structures} structures, {n_have} available "
+                  f"after filtering -- using all of them")
+        keys = available_keys["inchikey14"]
+    else:
+        keys = available_keys.sample(n=n_structures, seed=seed,
+                                     shuffle=True)["inchikey14"]
     sub = lf.filter(pl.col("inchikey14").is_in(keys.to_list())).collect()
     if max_spectra_per_structure:
         sub = (sub.with_columns(pl.int_range(pl.len()).over("inchikey14").alias("_i"))
