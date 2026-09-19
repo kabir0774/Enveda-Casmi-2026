@@ -1,0 +1,12 @@
+# Core. Pin rdkit to the grader's version before trusting local scores.
+rdkit==2026.3.3
+numpy>=2.0
+scipy>=1.14
+polars>=1.20
+pyarrow>=16
+lightgbm>=4.5
+tqdm>=4.66
+
+# GPU training. Install torch separately with the CUDA build that matches the
+# machine -- see scripts/setup_env.sh. Listed here for reference only.
+# torch>=2.5

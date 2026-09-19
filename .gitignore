@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Competition data is CC BY-NC 4.0 and must not be redistributed.
+data/
+*.parquet
+*.csv
+!sample_submission.csv
+
+# Model weights and run artefacts
+runs/
+*.pt
+*.ckpt
+cache/
+*.npy
+*.npz
+
+# Never commit credentials
+kaggle.json
+.kaggle/
+*.token
+.env
