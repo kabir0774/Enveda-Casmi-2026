@@ -121,6 +121,8 @@ def main() -> int:
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--fp-bits", type=int, default=2048)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--pos-weight-cap", type=float, default=50.0)
     ap.add_argument("--max-peaks", type=int, default=128)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
@@ -148,7 +150,9 @@ def main() -> int:
           f"({time.time()-t0:.1f}s)")
 
     train_sp, val_sp = split_by_key(spectra, 0.15, args.seed)
-    dcfg = DataConfig(max_peaks=args.max_peaks, fp_bits=args.fp_bits)
+    from casmi26.preprocess import CleanConfig
+    dcfg = DataConfig(max_peaks=args.max_peaks, fp_bits=args.fp_bits,
+                      clean=CleanConfig(max_peaks=args.max_peaks))
     print("preprocessing (once, cached for every epoch)...")
     train_ds = SpectrumFingerprintDataset(train_sp, dcfg, verbose=True)
     val_ds = SpectrumFingerprintDataset(val_sp, dcfg, verbose=True)
@@ -167,11 +171,12 @@ def main() -> int:
                         collate_fn=collate, num_workers=args.workers,
                         pin_memory=(device == "cuda"))
 
-    pw = pos_weight_from(train_ds).to(device)
+    pw = pos_weight_from(train_ds, cap=args.pos_weight_cap).to(device)
     print(f"pos_weight: median {pw.median().item():.1f}  max {pw.max().item():.1f}")
 
     cfg = ModelConfig(d_model=args.d_model, n_layers=args.layers, n_heads=args.heads,
-                      d_ff=args.d_model * 4, fp_bits=args.fp_bits, max_peaks=args.max_peaks)
+                      d_ff=args.d_model * 4, fp_bits=args.fp_bits, max_peaks=args.max_peaks,
+                      dropout=args.dropout)
     model = PeakFormer(cfg).to(device)
     if args.init_from:
         ck = torch.load(args.init_from, map_location=device)
@@ -183,6 +188,12 @@ def main() -> int:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps = max(1, len(train_dl) * args.epochs)
     warmup = int(steps * args.warmup_frac)
+    print(f"optimizer steps: {len(train_dl)}/epoch x {args.epochs} epochs = {steps}")
+    if steps < 500:
+        print(f"  WARNING: {steps} steps is not enough to train this model. It will "
+              f"plateau on a trivial solution regardless of learning rate.\n"
+              f"  Fix by lowering --batch-size, raising --epochs, or raising "
+              f"--structures. Aim for >= 1000 steps.")
 
     def lr_at(step):
         if step < warmup:
