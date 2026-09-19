@@ -16,15 +16,36 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-SHARED_COLUMNS = [
+# The competition's data page says train.parquet carries "the test columns
+# above, plus" the label columns. It does not. Verified against the real file
+# (2,539,608 rows): train has NEITHER molecule_id NOR spectrum_id.
+#
+#   train (18): ingest_lib, normalized_smiles, inchikey, inchikey14,
+#     molecular_formula, ionization_mode, instrument_type, adduct, adduct_orig,
+#     precursor_mz, precursor_error_ppm, ms2_mzs, ms2_normalized_intensities,
+#     num_peaks, base_peak_intensity, collision_energy_ev,
+#     collision_energy_orig, collision_energy_orig_units
+#   test (12): molecule_id, spectrum_id, + the acquisition columns
+#
+# So train gets a synthetic molecule_id = inchikey14, which is the right
+# grouping anyway: the metric scores per structure, and two spectra of the same
+# structure from different libraries belong to the same molecule.
+TEST_COLUMNS = [
     "molecule_id", "spectrum_id", "ms2_mzs", "ms2_normalized_intensities",
     "base_peak_intensity", "adduct", "ionization_mode", "instrument_type",
-    "precursor_mz", "collision_energy_ev",
+    "precursor_mz", "collision_energy_ev", "collision_energy_orig",
+    "collision_energy_orig_units",
 ]
-TRAIN_EXTRA = [
-    "normalized_smiles", "inchikey14", "molecular_formula", "ingest_lib",
-    "precursor_error_ppm", "num_peaks",
+TRAIN_COLUMNS = [
+    "ms2_mzs", "ms2_normalized_intensities", "base_peak_intensity", "adduct",
+    "ionization_mode", "instrument_type", "precursor_mz", "collision_energy_ev",
+    "normalized_smiles", "inchikey", "inchikey14", "molecular_formula",
+    "ingest_lib", "adduct_orig", "precursor_error_ppm", "num_peaks",
 ]
+
+# Kept for callers that imported the old names.
+SHARED_COLUMNS = TEST_COLUMNS
+TRAIN_EXTRA = [c for c in TRAIN_COLUMNS if c not in TEST_COLUMNS]
 
 # The ten adducts that appear in the test set. Training carries many more;
 # restricting to these is usually the right call for a model that will only
@@ -51,9 +72,27 @@ class LoadConfig:
     require_collision_energy: bool = False
 
 
+def available(path: str | Path, wanted: list[str]) -> list[str]:
+    """Intersect a wanted column list with what the file actually has.
+
+    Defensive on purpose: the published schema and the shipped file disagree,
+    and a re-run could change either.
+    """
+    have = set(pl.scan_parquet(str(path)).collect_schema().names())
+    return [c for c in wanted if c in have]
+
+
 def scan_train(path: str | Path, cfg: LoadConfig = LoadConfig()) -> pl.LazyFrame:
-    """Lazy, filtered view of train.parquet. Nothing is read until .collect()."""
-    lf = pl.scan_parquet(str(path)).select(SHARED_COLUMNS + TRAIN_EXTRA)
+    """Lazy, filtered view of train.parquet. Nothing is read until .collect().
+
+    Adds `spectrum_id` (row index) and `molecule_id` (= inchikey14), neither of
+    which exists in the shipped file.
+    """
+    lf = (pl.scan_parquet(str(path))
+            .select(available(path, TRAIN_COLUMNS))
+            .with_row_index("spectrum_id")
+            .with_columns(pl.col("inchikey14").alias("molecule_id"),
+                          pl.col("spectrum_id").cast(pl.Utf8)))
     if cfg.adducts:
         lf = lf.filter(pl.col("adduct").is_in(list(cfg.adducts)))
     if cfg.libraries:
@@ -75,7 +114,7 @@ def scan_train(path: str | Path, cfg: LoadConfig = LoadConfig()) -> pl.LazyFrame
 
 
 def scan_test(path: str | Path) -> pl.LazyFrame:
-    return pl.scan_parquet(str(path)).select(SHARED_COLUMNS)
+    return pl.scan_parquet(str(path)).select(available(path, TEST_COLUMNS))
 
 
 def _first_or(value, default=0.0) -> float:
@@ -98,8 +137,8 @@ def rows_to_spectra(df: pl.DataFrame, with_labels: bool = True) -> list[dict]:
         if mz.size == 0 or mz.size != it.size:
             continue
         rec = {
-            "molecule_id": row["molecule_id"],
-            "spectrum_id": row["spectrum_id"],
+            "molecule_id": row.get("molecule_id") or row.get("inchikey14"),
+            "spectrum_id": row.get("spectrum_id"),
             "mzs": mz,
             "intensities": it,
             "precursor_mz": float(row["precursor_mz"]),
