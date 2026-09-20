@@ -160,6 +160,11 @@ def main() -> int:
     # ---- per molecule -----------------------------------------------------
     predictions: dict[str, list[str]] = {}
     failures = 0
+    # Timed from the start of the loop, not from process start: the setup cost
+    # is paid once regardless of how many molecules follow, so folding it into
+    # a per-molecule rate overstates the remaining work by a wide margin.
+    t_loop = time.time()
+    log(f"setup complete in {t_loop - T0:.0f}s; predicting {len(all_ids)} molecules")
     for n, mol_id in enumerate(all_ids, start=1):
         qspecs = groups[mol_id]
         if not qspecs:
@@ -198,7 +203,7 @@ def main() -> int:
             predictions[mol_id] = fill_slots([], filler, k=MAX_GUESSES)
 
         if n % 50 == 0 or n == len(all_ids):
-            rate = (time.time() - T0) / n
+            rate = (time.time() - t_loop) / n
             log(f"{n}/{len(all_ids)} molecules  ({rate:.2f}s each, "
                 f"~{rate * (len(all_ids) - n) / 60:.1f} min left)")
 
@@ -210,6 +215,11 @@ def main() -> int:
     sizes = [len(v) for v in predictions.values()]
     log(f"wrote {a.out}: {len(predictions)} rows, "
         f"{min(sizes)}-{max(sizes)} guesses each")
+    setup = t_loop - T0
+    per_mol = (time.time() - t_loop) / max(len(all_ids), 1)
+    log(f"budget: {setup:.0f}s setup + {per_mol:.2f}s/molecule "
+        f"-> a full 400-molecule run is ~{(setup + 400 * per_mol) / 60:.0f} min "
+        f"of the 540 min Kaggle allows")
     return 0
 
 
