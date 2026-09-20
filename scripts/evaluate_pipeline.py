@@ -37,7 +37,8 @@ from casmi26.fusion import fuse_hits, gate_features, rank_candidates
 from casmi26.gate import (DualGate, dual_merge, fill_slots, oracle_merge,
                           retrieval_features)
 from casmi26.library import SpectralLibrary
-from casmi26.preprocess import BinConfig
+from casmi26.preprocess import BinConfig, CleanConfig, clean_peaks
+from casmi26.rescore import rescore_candidates
 from casmi26.metric import inchikey14, mrr_at_k, per_molecule_rr, validate_submission
 from casmi26.splits import build_splits, group_kfold_by_key, report_by_class
 
@@ -113,6 +114,12 @@ def main() -> int:
                          "cosine; 2 = NIST-style weighting of heavy fragments")
     ap.add_argument("--loss-weight", type=float, default=0.5,
                     help="weight of the neutral-loss channel relative to fragments")
+    ap.add_argument("--rescore", choices=["none", "entropy"], default="none",
+                    help="rerank the candidate shortlist with entropy "
+                         "similarity. Targets ranking, not recall")
+    ap.add_argument("--rescore-top-n", type=int, default=100)
+    ap.add_argument("--rescore-blend", type=float, default=1.0,
+                    help="1.0 = entropy score alone, 0.0 = keep cosine order")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -191,7 +198,8 @@ def main() -> int:
           f"({len(keep_in_library)} of them other spectra of class-1 val molecules); "
           f"final class mix {mix}")
     bin_cfg = BinConfig(mz_power=a.mz_power)
-    library = SpectralLibrary.build(lib_specs, bin_cfg=bin_cfg)
+    library = SpectralLibrary.build(lib_specs, bin_cfg=bin_cfg,
+                                    store_peaks=(a.rescore != "none"))
     print(f"library built ({time.time()-t0:.0f}s, mz_power={a.mz_power}, "
           f"loss_weight={a.loss_weight})")
 
@@ -265,6 +273,18 @@ def main() -> int:
         hits = library.search(qspecs, top_k=a.top_k_library,
                               loss_weight=a.loss_weight)
         cands = fuse_hits(hits, library)
+        if a.rescore == "entropy":
+            # Clean the query peaks once, the same way the library was cleaned,
+            # so both sides of the similarity see the same representation.
+            for q in qspecs:
+                if "_mzs" not in q:
+                    qmz, qit = clean_peaks(q["mzs"], q["intensities"],
+                                           q["precursor_mz"], CleanConfig())
+                    q["_mzs"], q["_ints"] = qmz, qit
+            cands = rescore_candidates(cands, qspecs, library,
+                                       top_n=a.rescore_top_n,
+                                       loss_weight=a.loss_weight,
+                                       blend=a.rescore_blend)
         lib_list = rank_candidates(cands, k=25)
 
         meta = {"precursor_mz": qspecs[0]["precursor_mz"],

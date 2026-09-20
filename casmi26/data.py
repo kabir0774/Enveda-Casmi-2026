@@ -177,7 +177,11 @@ def sample_structures(lf: pl.LazyFrame, n_structures: int, seed: int = 0,
     structures and 100k spectra answers most questions in minutes, and almost
     nothing you learn at that scale changes at full scale.
     """
-    available_keys = lf.select("inchikey14").unique().collect()
+    # .unique() does not guarantee row order in polars, and .sample() draws by
+    # position -- so the same seed over a differently-ordered frame selects a
+    # different set of structures on every run. Sorting makes the draw
+    # reproducible, which every A/B comparison depends on.
+    available_keys = lf.select("inchikey14").unique().sort("inchikey14").collect()
     n_have = available_keys.height
     if n_structures >= n_have:
         # Asking for more structures than exist is a reasonable thing to do --
@@ -192,7 +196,14 @@ def sample_structures(lf: pl.LazyFrame, n_structures: int, seed: int = 0,
                                      shuffle=True)["inchikey14"]
     sub = lf.filter(pl.col("inchikey14").is_in(keys.to_list())).collect()
     if max_spectra_per_structure:
-        sub = (sub.with_columns(pl.int_range(pl.len()).over("inchikey14").alias("_i"))
+        # Sort before the window. polars evaluates .over() across threads and
+        # the row order within a group is not stable between runs, so without
+        # this the SAME seed selects different spectra each time -- which
+        # changes which molecules have a spare spectrum for the library, which
+        # changes the class mix, which adds noise to every A/B comparison.
+        sort_cols = [c for c in ("inchikey14", "spectrum_id") if c in sub.columns]
+        sub = (sub.sort(sort_cols)
+                  .with_columns(pl.int_range(pl.len()).over("inchikey14").alias("_i"))
                   .filter(pl.col("_i") < max_spectra_per_structure)
                   .drop("_i"))
     return sub
@@ -228,4 +239,5 @@ def structure_catalogue(path: str | Path, cfg: LoadConfig | None = None) -> pl.D
     return (lf.group_by("inchikey14")
               .agg(pl.col("normalized_smiles").first(),
                    pl.col("molecular_formula").first())
+              .sort("inchikey14")
               .collect())

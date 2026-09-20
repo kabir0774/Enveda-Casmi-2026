@@ -37,7 +37,8 @@ class SpectralLibrary:
     def __init__(self, keys: np.ndarray, smiles: np.ndarray,
                  precursor_mz: np.ndarray,
                  frag: sparse.csr_matrix, loss: sparse.csr_matrix,
-                 bin_cfg: BinConfig | None = None):
+                 bin_cfg: BinConfig | None = None,
+                 peaks: list | None = None):
         assert frag.shape[0] == loss.shape[0] == len(keys) == len(smiles)
         self.keys = np.asarray(keys)
         self.smiles = np.asarray(smiles)
@@ -46,12 +47,19 @@ class SpectralLibrary:
         self.loss = loss.T.tocsr()
         self.n = len(keys)
         self.bin_cfg = bin_cfg or BinConfig()
+        # Cleaned peak lists, kept only when a rescoring stage needs them.
+        # ~50 peaks x 2 float32 x 500k spectra is a couple of hundred MB, which
+        # is worth it to rerank a shortlist with a similarity that cannot be
+        # written as a dot product.
+        self.peaks = peaks
 
     @classmethod
     def build(cls, spectra: list[dict], bin_cfg: BinConfig = BinConfig(),
-              clean_cfg: CleanConfig = CleanConfig()) -> "SpectralLibrary":
+              clean_cfg: CleanConfig = CleanConfig(),
+              store_peaks: bool = False) -> "SpectralLibrary":
         """spectra: dicts with mzs, intensities, precursor_mz, smiles, key."""
         frag_rows, loss_rows, keys, smis, prec = [], [], [], [], []
+        peaks: list | None = [] if store_peaks else None
         for s in spectra:
             mz, it = clean_peaks(s["mzs"], s["intensities"], s["precursor_mz"], clean_cfg)
             if mz.size == 0:
@@ -61,9 +69,12 @@ class SpectralLibrary:
             keys.append(s["key"])
             smis.append(s["smiles"])
             prec.append(s["precursor_mz"])
+            if peaks is not None:
+                peaks.append((mz.astype(np.float32), it.astype(np.float32)))
         frag = stack_to_csr(frag_rows, bin_cfg.n_bins)
         loss = stack_to_csr(loss_rows, bin_cfg.n_bins)
-        return cls(np.array(keys), np.array(smis), np.array(prec), frag, loss, bin_cfg)
+        return cls(np.array(keys), np.array(smis), np.array(prec), frag, loss,
+                   bin_cfg, peaks)
 
     def search(self, queries: list[dict], top_k: int = 200,
                bin_cfg: BinConfig | None = None, clean_cfg: CleanConfig = CleanConfig(),

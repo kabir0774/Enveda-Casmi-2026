@@ -25,6 +25,7 @@ class Candidate:
     sum_score: float = 0.0
     n_spectra_supporting: int = 0
     best_rank: int = 10 ** 9
+    best_row: int = -1        # library row that produced best_score
     rrf: float = 0.0          # reciprocal-rank fusion across spectra
     channels: set = field(default_factory=set)
 
@@ -50,6 +51,7 @@ def fuse_hits(hits_per_spectrum: list[list[Hit]], library: SpectralLibrary,
             cand.channels.add(h.channel)
             if h.score > cand.best_score:
                 cand.best_score = h.score
+                cand.best_row = h.library_row
             cand.best_rank = min(cand.best_rank, rank)
             if key not in seen_this_spectrum:
                 # count each spectrum once even if the structure appears in it twice
