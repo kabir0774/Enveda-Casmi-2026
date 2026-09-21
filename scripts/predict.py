@@ -37,6 +37,7 @@ from casmi26.library import SpectralLibrary
 from casmi26.metric import MAX_GUESSES, write_submission
 from casmi26.preprocess import BinConfig, CleanConfig, clean_peaks
 from casmi26.rescore import rescore_candidates
+from casmi26.candidates import build_candidate_db, neutral_mass
 
 T0 = time.time()
 
@@ -95,6 +96,14 @@ def main() -> int:
     ap.add_argument("--loss-weight", type=float, default=0.5)
     ap.add_argument("--rescore", choices=["none", "entropy"], default="entropy")
     ap.add_argument("--rescore-top-n", type=int, default=100)
+    ap.add_argument("--extra-candidates", default=None,
+                    help="directory holding bio_meta.pkl (+ bio_mass.npy) of an "
+                         "external structure set such as ChEBI + LIPID MAPS. "
+                         "Class 2 is by definition absent from the training "
+                         "structures, so without this the database cannot "
+                         "contain those answers at all")
+    ap.add_argument("--mass-tol-ppm", type=float, default=10.0)
+    ap.add_argument("--mass-tol-da", type=float, default=0.01)
     ap.add_argument("--library-slots", type=int, default=15,
                     help="slots reserved for library candidates before "
                          "retrieval fills the rest")
@@ -137,9 +146,23 @@ def main() -> int:
 
     # ---- candidate database and fallback ----------------------------------
     cat = structure_catalogue(a.train_parquet)
-    db_smiles = cat["normalized_smiles"].to_list()
-    db_formula = np.array([f or "" for f in cat["molecular_formula"].to_list()])
-    log(f"candidate database: {len(db_smiles)} structures")
+    extra_keys = extra_smiles = extra_masses = None
+    if a.extra_candidates:
+        import pickle
+        base = Path(a.extra_candidates)
+        meta = pickle.load(open(base / "bio_meta.pkl", "rb"))
+        extra_keys = np.asarray(meta["keys"])
+        extra_smiles = np.asarray(meta["smiles"])
+        mass_file = base / "bio_mass.npy"
+        extra_masses = np.load(mass_file) if mass_file.exists() else None
+        log(f"external candidates: {len(extra_keys)} structures from {base.name}")
+
+    db = build_candidate_db(cat["inchikey14"].to_list(),
+                            cat["normalized_smiles"].to_list(),
+                            cat["molecular_formula"].to_list(),
+                            extra_keys, extra_smiles, extra_masses)
+    db_smiles = list(db.smiles)
+    log(f"candidate database: {len(db)} structures searchable by mass")
 
     # Fallback list, used to pad short lists and to rescue a molecule whose
     # prediction raises. Most-frequent structures in the training data are the
@@ -154,8 +177,12 @@ def main() -> int:
     if a.checkpoint:
         model, cfg, device = load_model(a.checkpoint)
         from casmi26.torch_data import morgan_bits
+        # The external set ships its own 6,930-bit fingerprints, which are not
+        # the 2,048-bit Morgan the model predicts. Recomputing Morgan for the
+        # whole database costs about 40s and guarantees both sides of the
+        # similarity use the same representation.
         db_fp = np.stack([morgan_bits(s, cfg.fp_bits) for s in db_smiles])
-        log("database fingerprints built")
+        log(f"database fingerprints built ({db_fp.shape})")
 
     # ---- per molecule -----------------------------------------------------
     predictions: dict[str, list[str]] = {}
@@ -163,6 +190,7 @@ def main() -> int:
     # Timed from the start of the loop, not from process start: the setup cost
     # is paid once regardless of how many molecules follow, so folding it into
     # a per-molecule rate overstates the remaining work by a wide margin.
+    pool_sizes: list[int] = []
     t_loop = time.time()
     log(f"setup complete in {t_loop - T0:.0f}s; predicting {len(all_ids)} molecules")
     for n, mol_id in enumerate(all_ids, start=1):
@@ -187,11 +215,20 @@ def main() -> int:
             ret_list: list[str] = []
             if model is not None:
                 pred = predict_fingerprints(model, qspecs, device, cfg.fp_bits).mean(axis=0)
-                # No formula for the test molecules, so the pool is every
-                # structure. That is the honest situation: without a formula
-                # predictor this stage searches the whole catalogue.
-                sims = tanimoto(pred, db_fp)
-                order = np.argsort(sims)[::-1][:MAX_GUESSES]
+                # The adduct says how much mass ionisation added, so the
+                # neutral mass is recoverable and the pool shrinks from
+                # ~340,000 to a few hundred before any similarity is computed.
+                pool = None
+                for q in qspecs:
+                    m = neutral_mass(q["precursor_mz"], q.get("adduct"))
+                    if m is not None:
+                        pool = db.query_mass(m, a.mass_tol_da, a.mass_tol_ppm)
+                        break
+                if pool is None or pool.size == 0:
+                    pool = np.arange(len(db_smiles))   # unknown adduct: no filter
+                pool_sizes.append(int(pool.size))
+                sims = tanimoto(pred, db_fp[pool])
+                order = pool[np.argsort(sims)[::-1][:MAX_GUESSES]]
                 ret_list = [db_smiles[j] for j in order]
 
             merged = list(dict.fromkeys(lib_list + ret_list))
@@ -215,6 +252,10 @@ def main() -> int:
     sizes = [len(v) for v in predictions.values()]
     log(f"wrote {a.out}: {len(predictions)} rows, "
         f"{min(sizes)}-{max(sizes)} guesses each")
+    if pool_sizes:
+        ps = np.array(pool_sizes)
+        log(f"mass-filtered candidate pool: median {int(np.median(ps))}, "
+            f"mean {ps.mean():.0f}, max {ps.max()} of {len(db_smiles)}")
     setup = t_loop - T0
     per_mol = (time.time() - t_loop) / max(len(all_ids), 1)
     log(f"budget: {setup:.0f}s setup + {per_mol:.2f}s/molecule "
