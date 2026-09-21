@@ -313,7 +313,18 @@ def main() -> int:
     else:
         print("no checkpoint -> retrieval disabled, library search only")
 
+    # Padding for the tail of the 25 guesses. It normally comes from the
+    # candidate database, but the no-checkpoint path skips that entirely, and an
+    # empty filler makes fill_slots return [] for any molecule whose library
+    # search found nothing -- which validate_submission (rightly) rejects.
+    # Fall back to in-database structures so the filler is never empty and never
+    # leaks a held-out class-3 answer.
     filler = db_smiles[:40]
+    if not filler:
+        filler = [smiles_of[k] for k in all_keys
+                  if (k not in splits or splits[k].in_database)][:40]
+    if not filler:
+        raise SystemExit("no filler structures available")
     molecules, answers = [], {}
     pool_sizes = []
     class1_ranks: list[int] = []
@@ -379,6 +390,16 @@ def main() -> int:
         answers[key] = smiles_of[key]
         if (n + 1) % 100 == 0:
             print(f"  {n+1}/{len(val_keys)} molecules ({time.time()-t0:.0f}s)")
+
+    # The per-molecule loop is the expensive part (minutes to hours). Everything
+    # after it is cheap arithmetic that can still raise. Dump the raw guess
+    # lists first so a scoring bug costs a rerun of the scoring, not the search.
+    if a.out:
+        import pickle
+        dump = Path(a.out).with_suffix(".molecules.pkl")
+        dump.write_bytes(pickle.dumps({"molecules": molecules, "answers": answers,
+                                       "splits": splits, "argv": sys.argv}))
+        print(f"wrote {dump} ({len(molecules)} molecules)")
 
     # ---- gate trained on half, scored on the other half ---------------------
     half = group_kfold_by_key(list(answers), n_folds=2, seed=a.seed + 1)
