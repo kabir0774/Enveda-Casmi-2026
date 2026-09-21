@@ -119,6 +119,19 @@ def main() -> int:
                          "unrealistically small pool)")
     ap.add_argument("--mass-tol", type=float, default=0.01,
                     help="Da window, used only with --pool-by mass")
+    ap.add_argument("--extra-candidates", default=None,
+                    help="directory holding bio_meta.pkl (+ bio_mass.npy) of an "
+                         "external structure set such as ChEBI + LIPID MAPS. "
+                         "Merged into the candidate database exactly as "
+                         "predict.py does, so class-2 numbers measured here "
+                         "mean something on the leaderboard")
+    ap.add_argument("--honest-class2", action="store_true",
+                    help="drop class-2 answers from the TRAIN-derived database. "
+                         "Real class-2 structures are by definition absent from "
+                         "the training data; leaving them in guarantees the "
+                         "answer is present and makes class-2 look solved when "
+                         "it is not. With this flag a class-2 answer is only "
+                         "findable if --extra-candidates actually contains it")
     ap.add_argument("--query-spectra", type=int, default=3,
                     help="spectra per validation molecule used as the query; "
                          "these are always excluded from the library")
@@ -230,7 +243,32 @@ def main() -> int:
                 splits[k].in_library = False
                 demoted += 1
     val_set = set(val_keys)
-    lib_specs = [s for s in spectra if s["key"] not in val_set] + keep_in_library
+    # Excluding by file key is not enough. The metric canonicalises tautomers
+    # first, so a DIFFERENT catalogue structure can collapse onto the same
+    # InChIKey14 as a hidden class-2/3 answer -- and if its spectra stay in the
+    # library, the search returns a "wrong" structure that scores as correct.
+    # That is exactly the non-zero class-3 MRR seen in earlier runs. Restrict
+    # the check to same-formula structures: nothing else can be a tautomer.
+    hidden_keys = {k for k in val_keys if not splits[k].in_library}
+    hidden_metric = {inchikey14(smiles_of[k]) for k in hidden_keys if k in smiles_of}
+    hidden_metric.discard(None)
+    hidden_formulas = {(by_key[k][0].get("formula") or "") for k in hidden_keys
+                       if k in by_key}
+    hidden_formulas.discard("")
+    taut_drop, taut_checked = set(), 0
+    for k in all_keys:
+        if k in val_set or k not in smiles_of or k not in by_key:
+            continue
+        if (by_key[k][0].get("formula") or "") not in hidden_formulas:
+            continue
+        taut_checked += 1
+        if inchikey14(smiles_of[k]) in hidden_metric:
+            taut_drop.add(k)
+    if taut_checked:
+        print(f"library tautomer check: {taut_checked} same-formula structures, "
+              f"{len(taut_drop)} dropped as tautomers of a hidden answer")
+    lib_specs = [s for s in spectra
+                 if s["key"] not in val_set and s["key"] not in taut_drop] + keep_in_library
     if demoted:
         print(f"demoted {demoted} class-1 molecules to class 2 "
               f"(only one spectrum, nothing left for the library)")
@@ -249,6 +287,8 @@ def main() -> int:
     # never queried. Building it anyway costs a catalogue read plus a tautomer
     # check over thousands of same-formula entries -- about two minutes of
     # nothing, on exactly the library-only runs used for A/B comparisons.
+    drop_metric: set = set()
+    drop_novel: set = set()
     if a.checkpoint is None:
         db_keys, db_smiles = [], []
         db_formula = np.zeros(0, dtype=object)
@@ -266,9 +306,22 @@ def main() -> int:
         # class-3 structure excluded by file key can therefore still be present
         # under a tautomer, which shows up as a non-zero class-3 score.
         drop_file_keys = {k for k, v in splits.items() if not v.in_database}
+        if a.honest_class2:
+            n_before = len(drop_file_keys)
+            drop_file_keys |= {k for k, v in splits.items()
+                               if v.novelty_class == 2}
+            print(f"  --honest-class2: dropping {len(drop_file_keys)-n_before} "
+                  f"class-2 answers from the train-derived database")
         drop_metric = {inchikey14(smiles_of[k]) for k in drop_file_keys
                        if k in smiles_of}
         drop_metric.discard(None)
+        # Class 3 is novel: absent from the training data AND from PubChem /
+        # COCONUT, so it must not come back in through the external set either.
+        # Class 2 is the opposite -- being findable externally is exactly the
+        # thing --honest-class2 is trying to measure, so it is NOT dropped here.
+        drop_novel = {inchikey14(smiles_of[k]) for k, v in splits.items()
+                      if v.novelty_class == 3 and k in smiles_of}
+        drop_novel.discard(None)
         # Only a structure with the SAME MOLECULAR FORMULA can be a tautomer of
         # a dropped one, and tautomer canonicalisation costs ~10 ms. Running it
         # over all 275k catalogue entries takes about 45 minutes; restricting it
@@ -300,6 +353,49 @@ def main() -> int:
         db_formula = np.array([by_key[k][0].get("formula") or "" for k in db_keys])
         print(f"candidate database: {len(db_keys)} sampled structures "
               f"(class-2 numbers from this are optimistic)")
+
+    # ---- external candidate set --------------------------------------------
+    # The training catalogue cannot contain a real class-2 answer: class 2 means
+    # "in PubChem/COCONUT, no public spectra", which is precisely what the
+    # training data is not. Merging an external biological structure set is the
+    # only way a class-2 answer can be in the pool at all, and it is what the
+    # 0.339 public baseline does.
+    if a.extra_candidates and db_keys:
+        import pickle
+        from rdkit import Chem
+        from rdkit.Chem import rdMolDescriptors
+        base = Path(a.extra_candidates)
+        meta_x = pickle.load(open(base / "bio_meta.pkl", "rb"))
+        x_keys = list(np.asarray(meta_x["keys"]))
+        x_smiles = list(np.asarray(meta_x["smiles"]))
+        print(f"external candidates: {len(x_keys)} structures from {base.name}")
+        # Formula pooling is the realistic filter, so the external entries need
+        # formulas too. RDKit gives them in the same Hill-order string the
+        # catalogue uses; the charge suffix has to come off to match.
+        seen = set(db_keys)
+        drop_x = drop_novel
+        add_k, add_s, add_f = [], [], []
+        t_x = time.time()
+        for i, k in enumerate(x_keys):
+            if k in seen:
+                continue
+            mol = Chem.MolFromSmiles(x_smiles[i])
+            if mol is None:
+                continue
+            if drop_x and inchikey14(x_smiles[i]) in drop_x:
+                continue  # never let an excluded answer back in externally
+            f = rdMolDescriptors.CalcMolFormula(mol).rstrip("+-")
+            while f and f[-1].isdigit() and ("+" in f or "-" in f):
+                f = f[:-1]
+            seen.add(k)
+            add_k.append(k); add_s.append(x_smiles[i]); add_f.append(f)
+        print(f"  merged {len(add_k)} new external structures "
+              f"({len(x_keys)-len(add_k)} duplicate/unusable), {time.time()-t_x:.0f}s")
+        db_keys = list(db_keys) + add_k
+        db_smiles = list(db_smiles) + add_s
+        db_formula = np.concatenate([db_formula, np.array(add_f, dtype=object)])
+        db_mass = np.concatenate([db_mass, np.zeros(len(add_k))])
+        print(f"candidate database: {len(db_keys)} structures after merge")
 
     model = cfg = None
     db_fp = None
