@@ -37,7 +37,8 @@ from casmi26.library import SpectralLibrary
 from casmi26.metric import MAX_GUESSES, write_submission
 from casmi26.preprocess import BinConfig, CleanConfig, clean_peaks
 from casmi26.rescore import rescore_candidates
-from casmi26.candidates import build_candidate_db, neutral_mass
+from casmi26.candidates import (build_candidate_db, consensus_neutral_mass,
+                                neutral_mass)
 
 T0 = time.time()
 
@@ -219,11 +220,9 @@ def main() -> int:
                 # neutral mass is recoverable and the pool shrinks from
                 # ~340,000 to a few hundred before any similarity is computed.
                 pool = None
-                for q in qspecs:
-                    m = neutral_mass(q["precursor_mz"], q.get("adduct"))
-                    if m is not None:
-                        pool = db.query_mass(m, a.mass_tol_da, a.mass_tol_ppm)
-                        break
+                m = consensus_neutral_mass(qspecs)
+                if m is not None:
+                    pool = db.query_mass(m, a.mass_tol_da, a.mass_tol_ppm)
                 if pool is None or pool.size == 0:
                     pool = np.arange(len(db_smiles))   # unknown adduct: no filter
                 pool_sizes.append(int(pool.size))

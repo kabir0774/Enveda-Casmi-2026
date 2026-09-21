@@ -98,6 +98,31 @@ def neutral_mass(precursor_mz: float, adduct: str | None) -> float | None:
     return m if m > 0 else None
 
 
+def consensus_neutral_mass(spectra: list[dict], spread: float = 0.5) -> float | None:
+    """One neutral mass from all of a molecule's spectra.
+
+    A molecule is measured as several adducts, and each gives an independent
+    estimate of the same neutral mass. Taking the first resolvable one stakes
+    the entire candidate window on a single adduct label being right; if it is
+    wrong the window sits tens of Daltons away and the correct structure is
+    never considered at all.
+
+    The median across estimates survives one bad label, and estimates that
+    disagree with it by more than `spread` are dropped before the final median.
+    """
+    masses = []
+    for s in spectra:
+        m = neutral_mass(s.get("precursor_mz", 0.0), s.get("adduct"))
+        if m is not None:
+            masses.append(m)
+    if not masses:
+        return None
+    arr = np.asarray(masses, dtype=float)
+    med = float(np.median(arr))
+    agree = arr[np.abs(arr - med) <= spread]
+    return float(np.median(agree)) if agree.size else med
+
+
 @dataclass
 class CandidateDB:
     """Structures searchable by neutral mass."""
