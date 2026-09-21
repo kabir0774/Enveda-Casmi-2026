@@ -95,6 +95,14 @@ def main() -> int:
                     help="restrict the candidate database to the sampled "
                          "structures -- makes class-2 look far easier than it is")
     ap.add_argument("--val-molecules", type=int, default=600)
+    ap.add_argument("--val-libraries", default=None,
+                    help="draw validation molecules only from these source "
+                         "libraries, e.g. gnps,riken,enveda-np-examples. The "
+                         "test set is natural products; a validation set of "
+                         "random training structures is 67%% drug-like "
+                         "enveda-180 chemistry with many near-duplicate "
+                         "references, which makes class 1 look far easier "
+                         "than it is")
     ap.add_argument("--max-spectra-per-structure", type=int, default=6)
     ap.add_argument("--proportions", type=str, default="0.4,0.4,0.2",
                     help="assumed class 1,2,3 mix -- the real one is hidden")
@@ -154,6 +162,14 @@ def main() -> int:
                   "Retrain to get an honest retrieval number.")
 
     eligible = [k for k in all_keys if k not in trained_on]
+    if a.val_libraries:
+        wanted = {x.strip() for x in a.val_libraries.split(",")}
+        from_wanted = {s["key"] for s in spectra
+                       if (s.get("ingest_lib") or "") in wanted}
+        before = len(eligible)
+        eligible = [k for k in eligible if k in from_wanted]
+        print(f"validation restricted to {sorted(wanted)}: "
+              f"{before} -> {len(eligible)} eligible structures")
     print(f"{len(all_keys)} structures, {len(trained_on & set(all_keys))} of them "
           f"seen by the model -> {len(eligible)} eligible as validation molecules")
     rng = np.random.default_rng(a.seed)
