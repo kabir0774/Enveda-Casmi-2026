@@ -95,6 +95,12 @@ def main() -> int:
                     help="restrict the candidate database to the sampled "
                          "structures -- makes class-2 look far easier than it is")
     ap.add_argument("--val-molecules", type=int, default=600)
+    ap.add_argument("--cross-library-class1", action="store_true",
+                    help="a class-1 molecule's library references must come "
+                         "from a DIFFERENT source library than its query "
+                         "spectra. Without this, the reference is usually the "
+                         "same compound measured in the same run on the same "
+                         "instrument, which is not what the test set faces")
     ap.add_argument("--val-libraries", default=None,
                     help="draw validation molecules only from these source "
                          "libraries, e.g. gnps,riken,enveda-np-examples. The "
@@ -193,14 +199,33 @@ def main() -> int:
     demoted = 0
     for k in val_keys:
         specs = by_key[k]
-        n_query = max(1, min(a.query_spectra, len(specs) - 1)) if len(specs) > 1 else 1
-        queries[k] = specs[:n_query]
-        rest = specs[n_query:]
+        if a.cross_library_class1:
+            # Pick the query spectra from one source library and keep only
+            # OTHER libraries' spectra as the reference. A reference from the
+            # same submission is a near-duplicate measurement; the real task
+            # matches a fresh timsTOF acquisition against someone else's
+            # instrument, years earlier.
+            by_lib: dict[str, list[dict]] = {}
+            for s in specs:
+                by_lib.setdefault(s.get("ingest_lib") or "?", []).append(s)
+            if len(by_lib) > 1:
+                qlib = max(by_lib, key=lambda L: len(by_lib[L]))
+                q = by_lib[qlib][: a.query_spectra]
+                rest = [s for L, v in by_lib.items() if L != qlib for s in v]
+            else:
+                q, rest = specs[: a.query_spectra], []
+            queries[k] = q
+        else:
+            n_query = max(1, min(a.query_spectra, len(specs) - 1)) if len(specs) > 1 else 1
+            queries[k] = specs[:n_query]
+            rest = specs[n_query:]
         if splits[k].in_library:
             if rest:
                 keep_in_library.extend(rest)
             else:
-                # only one spectrum: no reference left, so it cannot be class 1
+                # No reference left (single spectrum, or with
+                # --cross-library-class1 no OTHER library measured it), so it
+                # cannot be class 1.
                 splits[k].novelty_class = 2
                 splits[k].in_library = False
                 demoted += 1
