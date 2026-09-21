@@ -245,7 +245,16 @@ def main() -> int:
           f"loss_weight={a.loss_weight})")
 
     # ---- candidate database: sized independently of the library -------------
-    if a.full_database:
+    # Without a checkpoint there is no retrieval, so the candidate database is
+    # never queried. Building it anyway costs a catalogue read plus a tautomer
+    # check over thousands of same-formula entries -- about two minutes of
+    # nothing, on exactly the library-only runs used for A/B comparisons.
+    if a.checkpoint is None:
+        db_keys, db_smiles = [], []
+        db_formula = np.zeros(0, dtype=object)
+        db_mass = np.zeros(0)
+        print("no checkpoint -> retrieval disabled, skipping candidate database")
+    elif a.full_database:
         print("building candidate database from the full structure catalogue...")
         cat = structure_catalogue(a.train_parquet)
         cat_keys = cat["inchikey14"].to_list()
